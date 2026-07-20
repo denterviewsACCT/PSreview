@@ -71,7 +71,7 @@ def review_statement(statement_text: str) -> dict:
 
     message = client.messages.create(
         model=config.CLAUDE_MODEL,
-        max_tokens=8000,
+        max_tokens=16000,
         system=system_prompt,
         messages=[
             {
@@ -81,6 +81,12 @@ def review_statement(statement_text: str) -> dict:
         ],
     )
 
+    if message.stop_reason == "max_tokens":
+        raise RuntimeError(
+            "Claude's response was cut off before finishing (hit the max_tokens "
+            "limit). Try raising max_tokens further in claude_review.py."
+        )
+
     raw = "".join(block.text for block in message.content if block.type == "text")
     raw = raw.strip()
     if raw.startswith("```"):
@@ -89,4 +95,13 @@ def review_statement(statement_text: str) -> dict:
             raw = raw[4:]
         raw = raw.strip()
 
-    return json.loads(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        # Log enough of the raw output to debug in Railway logs without
+        # flooding them if something goes very wrong.
+        import logging
+        logging.getLogger("ps-review").error(
+            "Claude returned invalid JSON (%s). First 2000 chars:\n%s", e, raw[:2000]
+        )
+        raise
