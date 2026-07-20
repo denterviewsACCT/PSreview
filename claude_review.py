@@ -65,7 +65,7 @@ comments. Follow the full review framework above for what to look for.
 
 
 def review_statement(statement_text: str) -> dict:
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, timeout=90.0)
 
     system_prompt = REVIEW_INSTRUCTIONS + "\n\n" + JSON_SCHEMA_INSTRUCTIONS
 
