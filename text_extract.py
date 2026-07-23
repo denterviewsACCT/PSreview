@@ -23,6 +23,47 @@ def extract_paragraphs_from_docx(docx_bytes: bytes) -> list[str]:
     return paragraphs
 
 
+def _reflow_wrapped_lines(lines: list[str]) -> list[str]:
+    """
+    Merge PDF line-wrap artifacts back into real paragraphs.
+
+    Many PDFs (especially ones exported from Word docs using "space after"
+    paragraph formatting instead of literal blank lines) don't preserve a
+    blank line between paragraphs at all -- pypdf's extract_text() then
+    just gives us one line per *wrapped* line of text, not one per
+    paragraph. Treating every such line as its own paragraph (the old
+    behavior) shreds a normal essay into dozens of fragment "paragraphs",
+    which both looks wrong in the output docx and breaks anchor/tracked-
+    change text matching whenever a comment's exact wording happens to
+    straddle one of those artificial line breaks.
+
+    Heuristic: a line that's close to the document's max observed line
+    width is almost certainly a mid-paragraph wrap (the renderer just ran
+    out of horizontal space), not an intentional paragraph break. A line
+    noticeably shorter than that is either the last line of the document
+    or an actual paragraph end. We merge lines into a paragraph until we
+    hit one of the "short" (real end) lines.
+    """
+    if not lines:
+        return []
+
+    max_width = max(len(l) for l in lines)
+    # Lines within 85% of the widest observed line are treated as
+    # mid-paragraph wraps rather than paragraph ends.
+    threshold = max_width * 0.85
+
+    paragraphs = []
+    current: list[str] = []
+    for line in lines:
+        current.append(line)
+        if len(line) < threshold:
+            paragraphs.append(" ".join(current))
+            current = []
+    if current:
+        paragraphs.append(" ".join(current))
+    return paragraphs
+
+
 def extract_paragraphs_from_pdf(pdf_bytes: bytes) -> list[str]:
     reader = PdfReader(io.BytesIO(pdf_bytes))
     full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
@@ -33,11 +74,12 @@ def extract_paragraphs_from_pdf(pdf_bytes: bytes) -> list[str]:
 
     # Some PDF exports collapse paragraph breaks entirely, leaving one
     # giant blob with only line-wrap newlines. If splitting on blank lines
-    # didn't actually separate anything, fall back to one paragraph per
-    # non-empty line rather than silently sending Claude/the docx builder
-    # one massive undifferentiated paragraph.
+    # didn't actually separate anything, fall back to reflowing wrapped
+    # lines back into real paragraphs (see _reflow_wrapped_lines) rather
+    # than treating every wrapped line as its own paragraph.
     if len(paragraphs) <= 1:
-        paragraphs = [line.strip() for line in full_text.splitlines() if line.strip()]
+        lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+        paragraphs = _reflow_wrapped_lines(lines)
 
     return paragraphs
 
