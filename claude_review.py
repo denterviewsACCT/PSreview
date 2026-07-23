@@ -65,11 +65,29 @@ comments. Follow the full review framework above for what to look for.
 
 
 def review_statement(statement_text: str) -> dict:
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY, timeout=90.0)
+    # Long timeout + max_retries=1: with streaming, tokens arrive continuously
+    # so we should never actually hit this timeout waiting on a big blocking
+    # read. It's a safety net for a truly dead connection, not the normal
+    # path. Capping retries at 1 (SDK default is 2) limits how many times a
+    # single slow-but-legitimate request can be re-sent -- each retry after
+    # Claude has already started/finished generating is a second paid call.
+    client = anthropic.Anthropic(
+        api_key=config.ANTHROPIC_API_KEY,
+        timeout=600.0,
+        max_retries=1,
+    )
 
     system_prompt = REVIEW_INSTRUCTIONS + "\n\n" + JSON_SCHEMA_INSTRUCTIONS
 
-    message = client.messages.create(
+    # Non-streaming client.messages.create() waits for Claude to fully
+    # finish generating (can be a couple minutes for a thorough review with
+    # max_tokens=16000) before sending anything back. If our client-side
+    # read times out during that wait, Claude has *already finished and
+    # been billed for* the generation -- we just failed to receive it, and
+    # the caller would have to pay for the whole thing again on retry.
+    # Streaming avoids this: we receive tokens as they're produced, so we
+    # never sit on one long blocking read.
+    with client.messages.stream(
         model=config.CLAUDE_MODEL,
         max_tokens=16000,
         system=system_prompt,
@@ -79,7 +97,10 @@ def review_statement(statement_text: str) -> dict:
                 "content": f"Here is the personal statement to review:\n\n{statement_text}",
             }
         ],
-    )
+    ) as stream:
+        for _ in stream.text_stream:
+            pass  # we just want the accumulated final message below
+        message = stream.get_final_message()
 
     if message.stop_reason == "max_tokens":
         raise RuntimeError(
