@@ -80,8 +80,8 @@ def review_statement(statement_text: str) -> dict:
     system_prompt = REVIEW_INSTRUCTIONS + "\n\n" + JSON_SCHEMA_INSTRUCTIONS
 
     # Non-streaming client.messages.create() waits for Claude to fully
-    # finish generating (can be a couple minutes for a thorough review with
-    # max_tokens=16000) before sending anything back. If our client-side
+    # finish generating (can take a while for a thorough review) before
+    # sending anything back. If our client-side
     # read times out during that wait, Claude has *already finished and
     # been billed for* the generation -- we just failed to receive it, and
     # the caller would have to pay for the whole thing again on retry.
@@ -89,7 +89,15 @@ def review_statement(statement_text: str) -> dict:
     # never sit on one long blocking read.
     with client.messages.stream(
         model=config.CLAUDE_MODEL,
-        max_tokens=16000,
+        max_tokens=32000,
+        # Claude Sonnet 5 runs with adaptive thinking on by default, and
+        # max_tokens is a hard cap on thinking + response combined. For a
+        # structured JSON review task we don't need reasoning exposed, and
+        # leaving thinking on was silently eating into the budget meant for
+        # the actual review -- almost certainly why this was hitting the
+        # max_tokens cutoff on longer statements. Disabling it means the
+        # whole max_tokens budget goes to the review itself.
+        thinking={"type": "disabled"},
         system=system_prompt,
         messages=[
             {
