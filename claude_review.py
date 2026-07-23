@@ -1,10 +1,15 @@
 """
-Calls Claude with the Denterview review prompt and asks for a structured
-JSON review instead of free-text -- that's what makes the output mechanically
+Calls Claude with the Denterview review prompt and gets back a structured
+review via native tool-calling -- that's what makes the output mechanically
 assemble-able into a docx with real Word comments and tracked changes.
+
+We use a forced tool call (rather than asking Claude to hand-write a JSON
+object as text) so the response is guaranteed well-formed, already-parsed
+JSON -- no manual json.loads(), no risk of a stray unescaped quote inside
+a comment (e.g. from quoting the student's own text) silently breaking the
+whole parse partway through a long response.
 """
 
-import json
 from pathlib import Path
 
 import anthropic
@@ -23,45 +28,84 @@ _start = MASTER_PROMPT.index(_START_MARKER)
 _end = MASTER_PROMPT.index(_END_MARKER)
 REVIEW_INSTRUCTIONS = MASTER_PROMPT[_start:_end].strip()
 
-JSON_SCHEMA_INSTRUCTIONS = """
-IMPORTANT -- output format:
+ANCHOR_RULES = """
+IMPORTANT -- rules for submitting your review:
 
-You must respond with ONLY a JSON object, no preamble, no markdown fences,
-nothing before or after it. It must match this shape exactly:
-
-{
-  "intro": "the red bold intro paragraph, 4-6 sentences, as one string",
-  "comments": [
-    {
-      "anchor": "the EXACT substring from the student's statement this comment is pinned to, copied verbatim, character for character, including punctuation",
-      "comment": "the comment text, in your normal Denterview voice",
-      "tracked_change": {
-        "old": "exact substring to delete, must be contained within or equal to the anchor",
-        "new": "the replacement text"
-      }
-    }
-  ],
-  "closing": "the red bold closing paragraph, ending with the second-edits link and sign-off, as one string"
-}
-
-Rules for "anchor":
-- It must be copied EXACTLY from the statement text below -- same spelling,
-  same punctuation, same capitalization. It will be used for an exact
-  substring search, so if it doesn't match character-for-character the
-  comment will be silently dropped.
+- "anchor" must be copied EXACTLY from the statement text below -- same
+  spelling, same punctuation, same capitalization. It will be used for an
+  exact substring search, so if it doesn't match character-for-character
+  the comment will be silently dropped.
 - Keep each anchor as short as possible while still being unique in the
   document -- ideally a single sentence, never a whole paragraph.
 - Do not let two anchors overlap each other.
-
-Rules for "tracked_change":
-- Omit this field entirely (do not include the key) if the comment is
-  purely observational and doesn't involve an actual text edit.
-- When present, "old" must be an exact substring of "anchor" (or equal to
-  it), and "new" is what it should become.
-
-Be as thorough as the statement requires -- there is no fixed number of
-comments. Follow the full review framework above for what to look for.
+- Omit "tracked_change" entirely if the comment is purely observational
+  and doesn't involve an actual text edit.
+- When present, tracked_change.old must be an exact substring of the
+  anchor (or equal to it), and tracked_change.new is what it should become.
+- Be as thorough as the statement requires -- there is no fixed number of
+  comments. Follow the full review framework above for what to look for.
 """
+
+SUBMIT_REVIEW_TOOL = {
+    "name": "submit_review",
+    "description": (
+        "Submit the completed structured review of the student's personal "
+        "statement: the intro paragraph, the pinned inline comments (with "
+        "optional tracked-change edits), and the closing paragraph."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intro": {
+                "type": "string",
+                "description": "The red bold intro paragraph, 4-6 sentences.",
+            },
+            "comments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "anchor": {
+                            "type": "string",
+                            "description": (
+                                "Exact verbatim substring from the student's "
+                                "statement this comment is pinned to."
+                            ),
+                        },
+                        "comment": {
+                            "type": "string",
+                            "description": "The comment text, in the normal Denterview voice.",
+                        },
+                        "tracked_change": {
+                            "type": "object",
+                            "description": "Optional suggested text edit within the anchor.",
+                            "properties": {
+                                "old": {
+                                    "type": "string",
+                                    "description": "Exact substring to delete, within the anchor.",
+                                },
+                                "new": {
+                                    "type": "string",
+                                    "description": "The replacement text.",
+                                },
+                            },
+                            "required": ["old", "new"],
+                        },
+                    },
+                    "required": ["anchor", "comment"],
+                },
+            },
+            "closing": {
+                "type": "string",
+                "description": (
+                    "The red bold closing paragraph, ending with the "
+                    "second-edits link and sign-off."
+                ),
+            },
+        },
+        "required": ["intro", "comments", "closing"],
+    },
+}
 
 
 def review_statement(statement_text: str) -> dict:
@@ -77,28 +121,31 @@ def review_statement(statement_text: str) -> dict:
         max_retries=1,
     )
 
-    system_prompt = REVIEW_INSTRUCTIONS + "\n\n" + JSON_SCHEMA_INSTRUCTIONS
+    system_prompt = REVIEW_INSTRUCTIONS + "\n\n" + ANCHOR_RULES
 
     # Non-streaming client.messages.create() waits for Claude to fully
     # finish generating (can take a while for a thorough review) before
-    # sending anything back. If our client-side
-    # read times out during that wait, Claude has *already finished and
-    # been billed for* the generation -- we just failed to receive it, and
-    # the caller would have to pay for the whole thing again on retry.
-    # Streaming avoids this: we receive tokens as they're produced, so we
-    # never sit on one long blocking read.
+    # sending anything back. If our client-side read times out during that
+    # wait, Claude has *already finished and been billed for* the
+    # generation -- we just failed to receive it, and the caller would have
+    # to pay for the whole thing again on retry. Streaming avoids this: we
+    # receive tokens as they're produced, so we never sit on one long
+    # blocking read.
     with client.messages.stream(
         model=config.CLAUDE_MODEL,
         max_tokens=32000,
         # Claude Sonnet 5 runs with adaptive thinking on by default, and
-        # max_tokens is a hard cap on thinking + response combined. For a
-        # structured JSON review task we don't need reasoning exposed, and
-        # leaving thinking on was silently eating into the budget meant for
-        # the actual review -- almost certainly why this was hitting the
-        # max_tokens cutoff on longer statements. Disabling it means the
-        # whole max_tokens budget goes to the review itself.
+        # max_tokens is a hard cap on thinking + response combined. We don't
+        # need reasoning exposed for this task, and forced tool_choice
+        # (below) isn't compatible with thinking left on anyway -- disabling
+        # it means the whole max_tokens budget goes to the review itself.
         thinking={"type": "disabled"},
         system=system_prompt,
+        tools=[SUBMIT_REVIEW_TOOL],
+        # Force the tool call rather than leaving it optional -- guarantees
+        # we get back a submit_review call with schema-valid, already-parsed
+        # JSON instead of free-text that might not even attempt the tool.
+        tool_choice={"type": "tool", "name": "submit_review"},
         messages=[
             {
                 "role": "user",
@@ -106,8 +153,6 @@ def review_statement(statement_text: str) -> dict:
             }
         ],
     ) as stream:
-        for _ in stream.text_stream:
-            pass  # we just want the accumulated final message below
         message = stream.get_final_message()
 
     if message.stop_reason == "max_tokens":
@@ -116,21 +161,13 @@ def review_statement(statement_text: str) -> dict:
             "limit). Try raising max_tokens further in claude_review.py."
         )
 
-    raw = "".join(block.text for block in message.content if block.type == "text")
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        # Log enough of the raw output to debug in Railway logs without
-        # flooding them if something goes very wrong.
-        import logging
-        logging.getLogger("ps-review").error(
-            "Claude returned invalid JSON (%s). First 2000 chars:\n%s", e, raw[:2000]
+    tool_use_blocks = [b for b in message.content if b.type == "tool_use"]
+    if not tool_use_blocks:
+        raise RuntimeError(
+            "Claude did not return a submit_review tool call. "
+            f"stop_reason={message.stop_reason!r}"
         )
-        raise
+
+    # .input is already a parsed dict -- guaranteed valid against the
+    # input_schema above, no json.loads() and no manual escaping to get wrong.
+    return tool_use_blocks[0].input
