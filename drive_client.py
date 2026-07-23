@@ -5,7 +5,7 @@ Thin wrapper around the Drive v3 API for the two folders we care about.
 import io
 import json
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
@@ -25,8 +25,19 @@ def _cache_filename(output_name: str) -> str:
 
 
 def _get_service():
-    info = json.loads(config.GOOGLE_SERVICE_ACCOUNT_JSON)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    # No access token stored/cached here -- Credentials starts with
+    # token=None, and google-api-python-client automatically refreshes
+    # using the refresh_token on the first request (and again whenever the
+    # short-lived access token expires), so this is a valid, self-renewing
+    # credential every time _get_service() is called.
+    creds = Credentials(
+        token=None,
+        refresh_token=config.GOOGLE_OAUTH_REFRESH_TOKEN,
+        client_id=config.GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=config.GOOGLE_OAUTH_CLIENT_SECRET,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=SCOPES,
+    )
     return build("drive", "v3", credentials=creds)
 
 
